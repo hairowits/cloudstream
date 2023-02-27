@@ -1,8 +1,11 @@
 package com.lagradost.cloudstream3.utils
 
+import android.animation.ObjectAnimator
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.app.Activity.RESULT_CANCELED
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.*
 import android.content.pm.PackageManager
 import android.database.Cursor
@@ -13,12 +16,11 @@ import android.media.tv.TvContract.Channels.COLUMN_INTERNAL_PROVIDER_ID
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
-import android.os.Build
-import android.os.Environment
-import android.os.ParcelFileDescriptor
+import android.os.*
 import android.provider.MediaStore
 import android.text.Spanned
 import android.util.Log
+import android.view.animation.DecelerateInterpolator
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.RequiresApi
@@ -27,19 +29,23 @@ import androidx.appcompat.app.AlertDialog
 import androidx.core.content.ContextCompat
 import androidx.core.text.HtmlCompat
 import androidx.core.text.toSpanned
+import androidx.core.widget.ContentLoadingProgressBar
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.FragmentActivity
 import androidx.navigation.fragment.findNavController
+import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import androidx.tvprovider.media.tv.*
 import androidx.tvprovider.media.tv.WatchNextProgram.fromCursor
+import androidx.viewpager2.widget.ViewPager2
 import com.fasterxml.jackson.module.kotlin.readValue
 import com.google.android.gms.cast.framework.CastContext
 import com.google.android.gms.cast.framework.CastState
 import com.google.android.gms.common.ConnectionResult
 import com.google.android.gms.common.GoogleApiAvailability
 import com.google.android.gms.common.wrappers.Wrappers
+import com.google.android.material.bottomsheet.BottomSheetDialog
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.CommonActivity.showToast
 import com.lagradost.cloudstream3.MainActivity.Companion.afterRepositoryLoadedEvent
@@ -50,6 +56,7 @@ import com.lagradost.cloudstream3.syncproviders.AccountManager.Companion.appStri
 import com.lagradost.cloudstream3.ui.WebviewFragment
 import com.lagradost.cloudstream3.ui.result.ResultFragment
 import com.lagradost.cloudstream3.ui.settings.SettingsFragment.Companion.isTrueTvSettings
+import com.lagradost.cloudstream3.ui.settings.SettingsFragment.Companion.isTvSettings
 import com.lagradost.cloudstream3.ui.settings.extensions.PluginsViewModel.Companion.downloadAll
 import com.lagradost.cloudstream3.ui.settings.extensions.RepositoryData
 import com.lagradost.cloudstream3.utils.Coroutines.ioSafe
@@ -65,6 +72,7 @@ import okhttp3.Cache
 import java.io.*
 import java.net.URL
 import java.net.URLDecoder
+import kotlin.system.measureTimeMillis
 
 object AppUtils {
     fun RecyclerView.setMaxViewPoolSize(maxViewTypeId: Int, maxPoolSize: Int) {
@@ -77,6 +85,19 @@ object AppUtils {
             this.layoutManager as? LinearLayoutManager?
         val adapter = adapter
         return if (layoutManager == null || adapter == null) false else layoutManager.findLastCompletelyVisibleItemPosition() < adapter.itemCount - 7 // bit more than 1 to make it more seamless
+    }
+
+    fun BottomSheetDialog?.ownHide() {
+        this?.hide()
+    }
+
+    fun BottomSheetDialog?.ownShow() {
+        // the reason for this is because show has a shitty animation we don't want
+        this?.window?.setWindowAnimations(-1)
+        this?.show()
+        Handler(Looper.getMainLooper()).postDelayed({
+            this?.window?.setWindowAnimations(R.style.Animation_Design_BottomSheetDialog)
+        }, 200)
     }
 
     //fun Context.deleteFavorite(data: SearchResponse) {
@@ -149,6 +170,48 @@ object AppUtils {
             }
 
         return builder.build()
+    }
+
+    // https://stackoverflow.com/a/67441735/13746422
+    fun ViewPager2.reduceDragSensitivity(f: Int = 4) {
+        val recyclerViewField = ViewPager2::class.java.getDeclaredField("mRecyclerView")
+        recyclerViewField.isAccessible = true
+        val recyclerView = recyclerViewField.get(this) as RecyclerView
+
+        val touchSlopField = RecyclerView::class.java.getDeclaredField("mTouchSlop")
+        touchSlopField.isAccessible = true
+        val touchSlop = touchSlopField.get(recyclerView) as Int
+        touchSlopField.set(recyclerView, touchSlop * f)       // "8" was obtained experimentally
+    }
+
+    fun ContentLoadingProgressBar?.animateProgressTo(to: Int) {
+        if (this == null) return
+        val animation: ObjectAnimator = ObjectAnimator.ofInt(
+            this,
+            "progress",
+            this.progress,
+            to
+        )
+        animation.duration = 500
+        animation.setAutoCancel(true)
+        animation.interpolator = DecelerateInterpolator()
+        animation.start()
+    }
+
+    fun Context.createNotificationChannel(channelId: String, channelName: String, description: String) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val importance = NotificationManager.IMPORTANCE_DEFAULT
+            val channel =
+                NotificationChannel(channelId, channelName, importance).apply {
+                    this.description = description
+                }
+
+            // Register the channel with the system.
+            val notificationManager: NotificationManager =
+                this.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+
+            notificationManager.createNotificationChannel(channel)
+        }
     }
 
     @SuppressLint("RestrictedApi")
@@ -316,10 +379,50 @@ object AppUtils {
         }
     }
 
+    abstract class DiffAdapter<T>(
+        open val items: MutableList<T>,
+        val comparison: (first: T, second: T) -> Boolean = { first, second ->
+            first.hashCode() == second.hashCode()
+        }
+    ) :
+        RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+        override fun getItemCount(): Int {
+            return items.size
+        }
+
+        fun updateList(newList: List<T>) {
+            val diffResult = DiffUtil.calculateDiff(
+                GenericDiffCallback(this.items, newList)
+            )
+
+            items.clear()
+            items.addAll(newList)
+
+            diffResult.dispatchUpdatesTo(this)
+        }
+
+        inner class GenericDiffCallback(
+            private val oldList: List<T>,
+            private val newList: List<T>
+        ) :
+            DiffUtil.Callback() {
+            override fun areItemsTheSame(oldItemPosition: Int, newItemPosition: Int) =
+                comparison(oldList[oldItemPosition], newList[newItemPosition])
+
+            override fun getOldListSize() = oldList.size
+
+            override fun getNewListSize() = newList.size
+
+            override fun areContentsTheSame(oldItemPosition: Int, newItemPosition: Int) =
+                oldList[oldItemPosition] == newList[newItemPosition]
+        }
+    }
+
+
     fun Activity.downloadAllPluginsDialog(repositoryUrl: String, repositoryName: String) {
         runOnUiThread {
             val context = this
-            val builder: AlertDialog.Builder = AlertDialog.Builder(this, R.style.AlertDialogCustom)
+            val builder: AlertDialog.Builder = AlertDialog.Builder(this)
             builder.setTitle(
                 repositoryName
             )
@@ -333,7 +436,7 @@ object AppUtils {
 
                 setNegativeButton(R.string.no) { _, _ -> }
             }
-            builder.show()
+            builder.show().setDefaultFocus()
         }
     }
 
@@ -386,6 +489,12 @@ object AppUtils {
                 openWebView(fragment, url)
             }
         }
+    }
+
+    fun Context.isNetworkAvailable(): Boolean {
+        val manager = this.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val activeNetworkInfo = manager.activeNetworkInfo
+        return activeNetworkInfo != null && activeNetworkInfo.isConnected || manager.allNetworkInfo?.any { it.isConnected } ?: false
     }
 
     fun splitQuery(url: URL): Map<String, String> {
@@ -556,6 +665,17 @@ object AppUtils {
         return false
     }
 
+    /**
+     * Sets the focus to the negative button when in TV and Emulator layout.
+     **/
+    fun AlertDialog.setDefaultFocus(buttonFocus: Int = DialogInterface.BUTTON_NEGATIVE) {
+        if (!isTvSettings()) return
+        this.getButton(buttonFocus).run {
+            isFocusableInTouchMode = true
+            requestFocus()
+        }
+    }
+
     // Copied from https://github.com/videolan/vlc-android/blob/master/application/vlc-android/src/org/videolan/vlc/util/FileUtils.kt
     @SuppressLint("Range")
     fun Context.getUri(data: Uri?): Uri? {
@@ -656,8 +776,13 @@ object AppUtils {
         return networkInfo.any {
             conManager.getNetworkCapabilities(it)
                 ?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+                    } &&
+                !networkInfo.any {
+                    conManager.getNetworkCapabilities(it)
+                        ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+                }
         }
-    }
+
 
     private fun Activity?.cacheClass(clazz: String?) {
         clazz?.let { c ->

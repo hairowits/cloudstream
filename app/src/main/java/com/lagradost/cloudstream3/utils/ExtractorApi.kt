@@ -229,6 +229,7 @@ val extractorApis: MutableList<ExtractorApi> = arrayListOf(
     StreamSB8(),
     StreamSB9(),
     StreamSB10(),
+    StreamSB11(),
     SBfull(),
     // Streamhub(), cause Streamhub2() works
     Streamhub2(),
@@ -254,15 +255,19 @@ val extractorApis: MutableList<ExtractorApi> = arrayListOf(
     //  WatchSB(), 'cause StreamSB.kt works
     Uqload(),
     Uqload1(),
+    Uqload2(),
     Evoload(),
     Evoload1(),
     VoeExtractor(),
     UpstreamExtractor(),
 
     Tomatomatela(),
+    TomatomatelalClub(),
     Cinestart(),
     OkRu(),
     OkRuHttps(),
+    Okrulink(),
+    Sendvid(),
 
     // dood extractors
     DoodCxExtractor(),
@@ -274,6 +279,7 @@ val extractorApis: MutableList<ExtractorApi> = arrayListOf(
     DoodShExtractor(),
     DoodWatchExtractor(),
     DoodWfExtractor(),
+    DoodYtExtractor(),
 
     AsianLoad(),
 
@@ -289,6 +295,7 @@ val extractorApis: MutableList<ExtractorApi> = arrayListOf(
     Supervideo(),
     GuardareStream(),
     CineGrabber(),
+    Vanfem(),
 
     // StreamSB.kt works
     //  SBPlay(),
@@ -319,6 +326,9 @@ val extractorApis: MutableList<ExtractorApi> = arrayListOf(
     DesuDrive(),
 
     Filesim(),
+    FileMoon(),
+    FileMoonSx(),
+    Vido(),
     Linkbox(),
     Acefile(),
     SpeedoStream(),
@@ -356,6 +366,10 @@ val extractorApis: MutableList<ExtractorApi> = arrayListOf(
     VidSrcExtractor2(),
     PlayLtXyz(),
     AStreamHub(),
+
+    Cda(),
+    Dailymotion(),
+    ByteShare(),
 )
 
 

@@ -13,8 +13,10 @@ import androidx.lifecycle.MutableLiveData
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.APIHolder.apis
 import com.lagradost.cloudstream3.APIHolder.getId
 import com.lagradost.cloudstream3.APIHolder.unixTime
+import com.lagradost.cloudstream3.APIHolder.unixTimeMS
 import com.lagradost.cloudstream3.AcraApplication.Companion.setKey
 import com.lagradost.cloudstream3.CommonActivity.getCastSession
 import com.lagradost.cloudstream3.CommonActivity.showToast
@@ -24,6 +26,7 @@ import com.lagradost.cloudstream3.LoadResponse.Companion.getMalId
 import com.lagradost.cloudstream3.LoadResponse.Companion.isMovie
 import com.lagradost.cloudstream3.metaproviders.SyncRedirector
 import com.lagradost.cloudstream3.mvvm.*
+import com.lagradost.cloudstream3.syncproviders.AccountManager
 import com.lagradost.cloudstream3.syncproviders.SyncAPI
 import com.lagradost.cloudstream3.syncproviders.providers.Kitsu
 import com.lagradost.cloudstream3.ui.APIRepository
@@ -55,7 +58,6 @@ import com.lagradost.cloudstream3.utils.DataStoreHelper.setResultSeason
 import com.lagradost.cloudstream3.utils.UIHelper.navigate
 import kotlinx.coroutines.*
 import java.io.File
-import java.lang.Math.abs
 import java.util.concurrent.TimeUnit
 
 
@@ -314,6 +316,11 @@ data class ExtractedTrailerData(
 class ResultViewModel2 : ViewModel() {
     private var currentResponse: LoadResponse? = null
 
+    fun clear() {
+        currentResponse = null
+        _page.postValue(null)
+    }
+
     data class EpisodeIndexer(
         val dubStatus: DubStatus,
         val season: Int,
@@ -340,9 +347,9 @@ class ResultViewModel2 : ViewModel() {
     //private val currentHeaderName get() = currentResponse?.name
 
 
-    private val _page: MutableLiveData<Resource<ResultData>> =
-        MutableLiveData(Resource.Loading())
-    val page: LiveData<Resource<ResultData>> = _page
+    private val _page: MutableLiveData<Resource<ResultData>?> =
+        MutableLiveData(null)
+    val page: LiveData<Resource<ResultData>?> = _page
 
     private val _episodes: MutableLiveData<ResourceSome<List<ResultEpisode>>> =
         MutableLiveData(ResourceSome.Loading())
@@ -398,13 +405,18 @@ class ResultViewModel2 : ViewModel() {
     private val _selectedDubStatusIndex: MutableLiveData<Int> = MutableLiveData(-1)
     val selectedDubStatusIndex: LiveData<Int> = _selectedDubStatusIndex
 
-
     private val _loadedLinks: MutableLiveData<Some<LinkProgress>> = MutableLiveData(Some.None)
     val loadedLinks: LiveData<Some<LinkProgress>> = _loadedLinks
 
     private val _resumeWatching: MutableLiveData<Some<ResumeWatchingStatus>> =
         MutableLiveData(Some.None)
     val resumeWatching: LiveData<Some<ResumeWatchingStatus>> = _resumeWatching
+
+    private val _episodeSynopsis: MutableLiveData<String?> = MutableLiveData(null)
+    val episodeSynopsis: LiveData<String?> = _episodeSynopsis
+
+    private val _subscribeStatus: MutableLiveData<Boolean?> = MutableLiveData(null)
+    val subscribeStatus: LiveData<Boolean?> = _subscribeStatus
 
     companion object {
         const val TAG = "RVM2"
@@ -418,7 +430,6 @@ class ResultViewModel2 : ViewModel() {
 
         fun updateWatchStatus(currentResponse: LoadResponse, status: WatchType) {
             val currentId = currentResponse.getId()
-            val resultPage = currentResponse
 
             DataStoreHelper.setResultWatchState(currentId, status.internalId)
             val current = DataStoreHelper.getBookmarkedData(currentId)
@@ -429,12 +440,12 @@ class ResultViewModel2 : ViewModel() {
                     currentId,
                     current?.bookmarkedTime ?: currentTime,
                     currentTime,
-                    resultPage.name,
-                    resultPage.url,
-                    resultPage.apiName,
-                    resultPage.type,
-                    resultPage.posterUrl,
-                    resultPage.year
+                    currentResponse.name,
+                    currentResponse.url,
+                    currentResponse.apiName,
+                    currentResponse.type,
+                    currentResponse.posterUrl,
+                    currentResponse.year
                 )
             )
         }
@@ -808,6 +819,42 @@ class ResultViewModel2 : ViewModel() {
         }
     }
 
+    /**
+     * @return true if the new status is Subscribed, false if not. Null if not possible to subscribe.
+     **/
+    fun toggleSubscriptionStatus(): Boolean? {
+        val isSubscribed = _subscribeStatus.value ?: return null
+        val response = currentResponse ?: return null
+        if (response !is EpisodeResponse) return null
+
+        val currentId = response.getId()
+
+        if (isSubscribed) {
+            DataStoreHelper.removeSubscribedData(currentId)
+        } else {
+            val current = DataStoreHelper.getSubscribedData(currentId)
+
+            DataStoreHelper.setSubscribedData(
+                currentId,
+                DataStoreHelper.SubscribedData(
+                    currentId,
+                    current?.bookmarkedTime ?: unixTimeMS,
+                    unixTimeMS,
+                    response.getLatestEpisodes(),
+                    response.name,
+                    response.url,
+                    response.apiName,
+                    response.type,
+                    response.posterUrl,
+                    response.year
+                )
+            )
+        }
+
+        _subscribeStatus.postValue(!isSubscribed)
+        return !isSubscribed
+    }
+
     private fun startChromecast(
         activity: Activity?,
         result: ResultEpisode,
@@ -1113,6 +1160,10 @@ class ResultViewModel2 : ViewModel() {
         )
     )
 
+    fun releaseEpisodeSynopsis() {
+        _episodeSynopsis.postValue(null)
+    }
+
     private suspend fun handleEpisodeClickEvent(activity: Activity?, click: EpisodeClickEvent) {
         when (click.action) {
             ACTION_SHOW_OPTIONS -> {
@@ -1149,6 +1200,17 @@ class ResultViewModel2 : ViewModel() {
                     )
                 )
 
+                // Do not add mark as watched on movies
+                if (!listOf(TvType.Movie, TvType.AnimeMovie).contains(click.data.tvType)) {
+                    val isWatched =
+                        DataStoreHelper.getVideoWatchState(click.data.id) == VideoWatchState.Watched
+
+                    val watchedText = if (isWatched) R.string.action_remove_from_watched
+                    else R.string.action_mark_as_watched
+
+                    options.add(txt(watchedText) to ACTION_MARK_AS_WATCHED)
+                }
+
                 postPopup(
                     txt(
                         activity?.getNameFull(
@@ -1181,6 +1243,10 @@ class ResultViewModel2 : ViewModel() {
                     }
                 }
             }
+            ACTION_SHOW_DESCRIPTION -> {
+                _episodeSynopsis.postValue(click.data.description)
+            }
+
             /* not implemented, not used
             ACTION_DOWNLOAD_EPISODE_SUBTITLE -> {
                 loadLinks(click.data, isVisible =  false, isCasting = false) { links ->
@@ -1365,7 +1431,7 @@ class ResultViewModel2 : ViewModel() {
                     R.id.global_to_navigation_player,
                     GeneratorPlayer.newInstance(
                         generator?.also {
-                            it.getAll() // I know kinda shit to itterate all, but it is 100% sure to work
+                            it.getAll() // I know kinda shit to iterate all, but it is 100% sure to work
                                 ?.indexOfFirst { value -> value is ResultEpisode && value.id == click.data.id }
                                 ?.let { index ->
                                     if (index >= 0)
@@ -1376,6 +1442,19 @@ class ResultViewModel2 : ViewModel() {
                     )
                 )
             }
+            ACTION_MARK_AS_WATCHED -> {
+                val isWatched =
+                    DataStoreHelper.getVideoWatchState(click.data.id) == VideoWatchState.Watched
+
+                if (isWatched) {
+                    DataStoreHelper.setVideoWatchState(click.data.id, VideoWatchState.None)
+                } else {
+                    DataStoreHelper.setVideoWatchState(click.data.id, VideoWatchState.Watched)
+                }
+
+                // Kinda dirty to reload all episodes :(
+                reloadEpisodes()
+            }
         }
     }
 
@@ -1384,79 +1463,128 @@ class ResultViewModel2 : ViewModel() {
         meta: SyncAPI.SyncResult?,
         syncs: Map<String, String>? = null
     ): Pair<LoadResponse, Boolean> {
-        if (meta == null) return resp to false
+        //if (meta == null) return resp to false
         var updateEpisodes = false
         val out = resp.apply {
             Log.i(TAG, "applyMeta")
 
-            duration = duration ?: meta.duration
-            rating = rating ?: meta.publicScore
-            tags = tags ?: meta.genres
-            plot = if (plot.isNullOrBlank()) meta.synopsis else plot
-            posterUrl = posterUrl ?: meta.posterUrl ?: meta.backgroundPosterUrl
-            actors = actors ?: meta.actors
+            if (meta != null) {
+                duration = duration ?: meta.duration
+                rating = rating ?: meta.publicScore
+                tags = tags ?: meta.genres
+                plot = if (plot.isNullOrBlank()) meta.synopsis else plot
+                posterUrl = posterUrl ?: meta.posterUrl ?: meta.backgroundPosterUrl
+                actors = actors ?: meta.actors
 
-            if (this is EpisodeResponse) {
-                nextAiring = nextAiring ?: meta.nextAiring
+                if (this is EpisodeResponse) {
+                    nextAiring = nextAiring ?: meta.nextAiring
+                }
+
+                val realRecommendations = ArrayList<SearchResponse>()
+                val apiNames = apis.filter {
+                    it.name.contains("gogoanime", true) ||
+                            it.name.contains("9anime", true)
+                }.map {
+                    it.name
+                }
+
+                meta.recommendations?.forEach { rec ->
+                    apiNames.forEach { name ->
+                        realRecommendations.add(rec.copy(apiName = name))
+                    }
+                }
+
+                recommendations = recommendations?.union(realRecommendations)?.toList()
+                    ?: realRecommendations
             }
 
             for ((k, v) in syncs ?: emptyMap()) {
                 syncData[k] = v
             }
 
-            val realRecommendations = ArrayList<SearchResponse>()
-            // TODO: fix
-            //val apiNames = listOf(GogoanimeProvider().name, NineAnimeProvider().name)
-            // meta.recommendations?.forEach { rec ->
-            //     apiNames.forEach { name ->
-            //         realRecommendations.add(rec.copy(apiName = name))
-            //     }
-            // }
+            argamap(
+                {
+                    if (this !is AnimeLoadResponse) return@argamap
+                    // already exist, no need to run getTracker
+                    if (this.getAniListId() != null && this.getMalId() != null) return@argamap
 
-            recommendations = recommendations?.union(realRecommendations)?.toList()
-                ?: realRecommendations
-
-            argamap({
-                addTrailer(meta.trailers)
-            }, {
-                if (this !is AnimeLoadResponse) return@argamap
-                val map =
-                    Kitsu.getEpisodesDetails(
-                        getMalId(),
-                        getAniListId(),
-                        isResponseRequired = false
+                    val res = APIHolder.getTracker(
+                        listOfNotNull(
+                            this.engName,
+                            this.name,
+                            this.japName
+                        ).filter { it.length > 2 }
+                            .distinct(), // the reason why we filter is due to not wanting smth like " " or "?"
+                        TrackerType.getTypes(this.type),
+                        this.year
                     )
-                if (map.isNullOrEmpty()) return@argamap
-                updateEpisodes = DubStatus.values().map { dubStatus ->
-                    val current =
-                        this.episodes[dubStatus]?.mapIndexed { index, episode ->
-                            episode.apply {
-                                this.episode = this.episode ?: (index + 1)
-                            }
-                        }?.sortedBy { it.episode ?: 0 }?.toMutableList()
-                    if (current.isNullOrEmpty()) return@map false
-                    val episodeNumbers = current.map { ep -> ep.episode!! }
-                    var updateCount = 0
-                    map.forEach { (episode, node) ->
-                        episodeNumbers.binarySearch(episode).let { index ->
-                            current.getOrNull(index)?.let { currentEp ->
-                                current[index] = currentEp.apply {
-                                    updateCount++
-                                    val currentBack = this
-                                    this.description = this.description ?: node.description?.en
-                                    this.name = this.name ?: node.titles?.canonical
-                                    this.episode =
-                                        this.episode ?: node.num ?: episodeNumbers[index]
-                                    this.posterUrl =
-                                        this.posterUrl ?: node.thumbnail?.original?.url
+
+                    val ids = arrayOf(
+                        AccountManager.malApi.idPrefix to res?.malId?.toString(),
+                        AccountManager.aniListApi.idPrefix to res?.aniId
+                    )
+
+                    if (ids.any { (id, new) ->
+                            val current = syncData[id]
+                            new != null && current != null && current != new
+                        }
+                    ) {
+                        // getTracker fucked up as it conflicts with current implementation
+                        return@argamap
+                    }
+
+                    // set all the new data, prioritise old correct data
+                    ids.forEach { (id, new) ->
+                        new?.let {
+                            syncData[id] = syncData[id] ?: it
+                        }
+                    }
+
+                    // set posters, might fuck up due to headers idk
+                    posterUrl = posterUrl ?: res?.image
+                    backgroundPosterUrl = backgroundPosterUrl ?: res?.cover
+                },
+                {
+                    if (meta == null) return@argamap
+                    addTrailer(meta.trailers)
+                }, {
+                    if (this !is AnimeLoadResponse) return@argamap
+                    val map =
+                        Kitsu.getEpisodesDetails(
+                            getMalId(),
+                            getAniListId(),
+                            isResponseRequired = false
+                        )
+                    if (map.isNullOrEmpty()) return@argamap
+                    updateEpisodes = DubStatus.values().map { dubStatus ->
+                        val current =
+                            this.episodes[dubStatus]?.mapIndexed { index, episode ->
+                                episode.apply {
+                                    this.episode = this.episode ?: (index + 1)
+                                }
+                            }?.sortedBy { it.episode ?: 0 }?.toMutableList()
+                        if (current.isNullOrEmpty()) return@map false
+                        val episodeNumbers = current.map { ep -> ep.episode!! }
+                        var updateCount = 0
+                        map.forEach { (episode, node) ->
+                            episodeNumbers.binarySearch(episode).let { index ->
+                                current.getOrNull(index)?.let { currentEp ->
+                                    current[index] = currentEp.apply {
+                                        updateCount++
+                                        this.description = this.description ?: node.description?.en
+                                        this.name = this.name ?: node.titles?.canonical
+                                        this.episode =
+                                            this.episode ?: node.num ?: episodeNumbers[index]
+                                        this.posterUrl =
+                                            this.posterUrl ?: node.thumbnail?.original?.url
+                                    }
                                 }
                             }
                         }
-                    }
-                    this.episodes[dubStatus] = current
-                    updateCount > 0
-                }.any { it }
-            })
+                        this.episodes[dubStatus] = current
+                        updateCount > 0
+                    }.any { it }
+                })
         }
         return out to updateEpisodes
     }
@@ -1524,7 +1652,13 @@ class ResultViewModel2 : ViewModel() {
                 val end = minOf(list.size, start + length)
                 list.subList(start, end).map {
                     val posDur = getViewPos(it.id)
-                    it.copy(position = posDur?.position ?: 0, duration = posDur?.duration ?: 0)
+                    val watchState =
+                        DataStoreHelper.getVideoWatchState(it.id) ?: VideoWatchState.None
+                    it.copy(
+                        position = posDur?.position ?: 0,
+                        duration = posDur?.duration ?: 0,
+                        videoWatchState = watchState
+                    )
                 }
             }
             ?: emptyList()
@@ -1577,6 +1711,16 @@ class ResultViewModel2 : ViewModel() {
         postResume()
     }
 
+    private fun postSubscription(loadResponse: LoadResponse) {
+        if (loadResponse.isEpisodeBased()) {
+            val id = loadResponse.getId()
+            val data = DataStoreHelper.getSubscribedData(id)
+            DataStoreHelper.updateSubscribedData(id, data, loadResponse as? EpisodeResponse)
+            val isSubscribed = data != null
+            _subscribeStatus.postValue(isSubscribed)
+        }
+    }
+
     private fun postEpisodeRange(indexer: EpisodeIndexer?, range: EpisodeRange?) {
         if (range == null || indexer == null) {
             return
@@ -1587,10 +1731,11 @@ class ResultViewModel2 : ViewModel() {
         if (ranges?.contains(range) != true) {
             // if the current ranges does not include the range then select the range with the closest matching start episode
             // this usually happends when dub has less episodes then sub -> the range does not exist
-            ranges?.minByOrNull { abs(it.startEpisode - range.startEpisode) }?.let { r ->
-                postEpisodeRange(indexer, r)
-                return
-            }
+            ranges?.minByOrNull { kotlin.math.abs(it.startEpisode - range.startEpisode) }
+                ?.let { r ->
+                    postEpisodeRange(indexer, r)
+                    return
+                }
         }
 
         val isMovie = currentResponse?.isMovie() == true
@@ -1712,6 +1857,7 @@ class ResultViewModel2 : ViewModel() {
     ) {
         currentResponse = loadResponse
         postPage(loadResponse, apiRepository)
+        postSubscription(loadResponse)
         if (updateEpisodes)
             postEpisodes(loadResponse, updateFillers)
     }
@@ -1921,7 +2067,7 @@ class ResultViewModel2 : ViewModel() {
         // this takes the indexer most preferable by the user given the current sorting
         val min = ranges.keys.minByOrNull { index ->
             kotlin.math.abs(
-                index.season - (preferStartSeason ?: 0)
+                index.season - (preferStartSeason ?: 1)
             ) + if (index.dubStatus == preferDubStatus) 0 else 100000
         }
 
@@ -2071,8 +2217,9 @@ class ResultViewModel2 : ViewModel() {
         showFillers: Boolean,
         dubStatus: DubStatus,
         autostart: AutoResume?,
+        loadTrailers: Boolean = true,
     ) =
-        viewModelScope.launchSafe {
+        ioSafe {
             _page.postValue(Resource.Loading(url))
             _episodes.postValue(ResourceSome.Loading())
 
@@ -2090,7 +2237,7 @@ class ResultViewModel2 : ViewModel() {
                         "This provider does not exist"
                     )
                 )
-                return@launchSafe
+                return@ioSafe
             }
 
 
@@ -2098,24 +2245,18 @@ class ResultViewModel2 : ViewModel() {
             val validUrlResource = safeApiCall {
                 SyncRedirector.redirect(
                     url,
-                    api.mainUrl
+                    api
                 )
             }
-            // TODO: fix
-            // val validUrlResource = safeApiCall {
-            //     SyncRedirector.redirect(
-            //         url,
-            //         api.mainUrl.replace(NineAnimeProvider().mainUrl, "9anime")
-            //             .replace(GogoanimeProvider().mainUrl, "gogoanime")
-            //     )
-            // }
+
             if (validUrlResource !is Resource.Success) {
                 if (validUrlResource is Resource.Failure) {
                     _page.postValue(validUrlResource)
                 }
 
-                return@launchSafe
+                return@ioSafe
             }
+
             val validUrl = validUrlResource.value
             val repo = APIRepository(api)
             currentRepo = repo
@@ -2125,16 +2266,16 @@ class ResultViewModel2 : ViewModel() {
                     _page.postValue(data)
                 }
                 is Resource.Success -> {
-                    if (!isActive) return@launchSafe
+                    if (!isActive) return@ioSafe
                     val loadResponse = ioWork {
                         applyMeta(data.value, currentMeta, currentSync).first
                     }
-                    if (!isActive) return@launchSafe
+                    if (!isActive) return@ioSafe
                     val mainId = loadResponse.getId()
 
                     preferDubStatus = getDub(mainId) ?: preferDubStatus
                     preferStartEpisode = getResultEpisode(mainId)
-                    preferStartSeason = getResultSeason(mainId)
+                    preferStartSeason = getResultSeason(mainId) ?: 1
 
                     setKey(
                         DOWNLOAD_HEADER_CACHE,
@@ -2149,15 +2290,15 @@ class ResultViewModel2 : ViewModel() {
                             System.currentTimeMillis(),
                         )
                     )
-
-                    loadTrailers(data.value)
+                    if (loadTrailers)
+                        loadTrailers(data.value)
                     postSuccessful(
                         data.value,
                         updateEpisodes = true,
                         updateFillers = showFillers,
                         apiRepository = repo
                     )
-                    if (!isActive) return@launchSafe
+                    if (!isActive) return@ioSafe
                     handleAutoStart(activity, autostart)
                 }
                 is Resource.Loading -> {
